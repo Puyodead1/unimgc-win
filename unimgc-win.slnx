@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="unimgc-win/unimgc-win.vcxproj" />
+  <Project Path="unimgc-win/unimgc-win.vcxproj" Id="97851110-7ab8-4444-9bd2-a878da5ab0fb" />
 </Solution>

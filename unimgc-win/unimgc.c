@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <windows.h>
 
 #include "endian.h"
 #include "image.h"
@@ -47,7 +48,7 @@ static double si_ify(uint64_t n, char *u)
     return (double)n;
 }
 
-static void dump_header(struct imgc_header *hdr)
+static void dump_header(struct imgc_header *hdr, FILE *in)
 {
     fprintf(stderr, "volume metadata:\n");
     fprintf(stderr, "  model: %s\n", pascal_to_cstr(&hdr->volume.model));
@@ -62,6 +63,31 @@ static void dump_header(struct imgc_header *hdr)
     fprintf(stderr, "image metadata:\n");
     fprintf(stderr, "  size: %.02f %ciB (%" PRIu64 " sectors * %" PRIu64 " bytes)\n",
         size, unit, hdr->image.sector_count, hdr->image.sector_size);
+    if (in) {
+        long long saved_pos = _ftelli64(in);
+        uint64_t actual_data = 0;
+        uint8_t bhbuf[IMGC_BLOCK_HEADER_SIZE];
+
+        while (fread(bhbuf, 1, sizeof(bhbuf), in) == sizeof(bhbuf)) {
+            struct imgc_block_header bhdr;
+            if (imgc_parse_block(bhbuf, sizeof(bhbuf), &bhdr) < 0)
+                break;
+
+            size_t block_data_size = bhdr.size - IMGC_BLOCK_HEADER_SIZE;
+
+            if (bhdr.type == IMGC_BLOCK_COMPRESSED) {
+                actual_data += block_data_size;
+            }
+            // Skip the block data
+            _fseeki64(in, block_data_size, SEEK_CUR);
+        }
+
+        // Restore position
+        _fseeki64(in, saved_pos, SEEK_SET);
+
+        double sparse_size = si_ify(actual_data, &unit);
+        fprintf(stderr, "  sparse size: %.02f %ciB (actual data on disk)\n", sparse_size, unit);
+    }
     fprintf(stderr, "  unk1: %016" PRIx64 "\n", hdr->image.unk1);
     fprintf(stderr, "  unk2: %016" PRIx64 "\n", hdr->image.unk2);
     fprintf(stderr, "  unk3: %02" PRIx8 "\n",  hdr->image.unk3);
@@ -144,14 +170,20 @@ static void unimgc_data(struct imgc_header *hdr, FILE *in, FILE *out)
             break;
         }
         case IMGC_BLOCK_ZERO: {
-            size_t dsz = le64toh(*(uint64_t *)bbuf);
+            size_t dsz = le64toh(*(uint64_t*)bbuf);
             if (options.verbose >= 2)
-                fprintf(stderr, "  zero: %zu\n", dsz);
+                fprintf(stderr, "  zero: %zu (sparse)\n", dsz);
 
-            while (dsz > sizeof(zeros))
-                dsz -= fwrite(zeros, 1, sizeof(zeros), out);
-            if (fwrite(zeros, 1, dsz, out) != dsz)
-                fatal(UNIMGC_ERROR_IO, "could not write %zu bytes to target file: %s\n", dsz, strerror(errno));
+            if (_fseeki64(out, dsz, SEEK_CUR) != 0)
+                fatal(UNIMGC_ERROR_IO, "could not seek in target file: %s\n", strerror(errno));
+
+            long long pos = _ftelli64(out);
+            if (pos > 0) {
+                if (_fseeki64(out, pos - 1, SEEK_SET) != 0)
+                    fatal(UNIMGC_ERROR_IO, "could not seek back in target file: %s\n", strerror(errno));
+                char zero = 0;
+                fwrite(&zero, 1, 1, out);
+            }
             break;
         }
         default:
@@ -163,6 +195,12 @@ static void unimgc_data(struct imgc_header *hdr, FILE *in, FILE *out)
         fputc('\n', stderr);
 }
 
+static void make_sparse(FILE* f) {
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    DWORD bytesReturned;
+    DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &bytesReturned, NULL);
+}
+
 static void unimgc_header(struct imgc_header *hdr, FILE *in)
 {
     uint8_t hbuf[IMGC_HEADER_SIZE];
@@ -172,7 +210,7 @@ static void unimgc_header(struct imgc_header *hdr, FILE *in)
         fatal(UNIMGC_ERROR_CORRUPTED_FILE, "invalid IMGC header\n");
     
     if (options.only_info || options.verbose >= 1)
-        dump_header(hdr);
+        dump_header(hdr, in);
 }
 
 
@@ -230,6 +268,9 @@ int main(int argc, char **argv)
     FILE *out = open_or(argc > 1 ? argv[optind + 1] : NULL, "wb", stdout);
     if (!out)
         fatal(UNIMGC_ERROR_IO, "could not open output %s: %s\n", argv[optind + 1], strerror(errno));
+
+    if (out != stdout)
+        make_sparse(out);
 
     /* do the boogie */
     struct imgc_header hdr;
